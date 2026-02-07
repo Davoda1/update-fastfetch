@@ -29,9 +29,10 @@ A small POSIX `sh` script that updates **Fastfetch** on Debian/Ubuntu-like syste
 update-fastfetch
 ```
 
-### Flags (exactly 0 or 1 flag allowed)
+### Flags (exactly 0 or 1 flag allowed [except for `--no-color`])
 
 This script is intentionally strict: **use at most one flag**. If you provide multiple flags, unknown options, or positional arguments, it exits with code `2`.
+The only exception is `--no-color` that can be used with other flags.
 
 ```sh
 update-fastfetch --polyfilled
