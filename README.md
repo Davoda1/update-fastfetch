@@ -40,6 +40,9 @@ update-fastfetch --self-test
 update-fastfetch --no-color
 update-fastfetch --help
 update-fastfetch --version
+update-fastfetch --version --no-color
+update-fastfetch --no-color --self-test
+NO_COLOR=1 ./update-fastfetch -h
 ```
 
 #### `--polyfilled`
