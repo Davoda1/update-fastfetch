@@ -76,7 +76,7 @@ sudo install -m 0755 update-fastfetch /usr/local/bin/update-fastfetch
 
 This script downloads official prebuilt `.deb` assets from the upstream Fastfetch GitHub Releases page over HTTPS.
 
-- It verifies the downloaded `.deb` against the SHA-256 listed in the upstream release notes (when available).
+- It verifies the downloaded .deb against the SHA-256 listed in the upstream release notes; if it can’t find a matching checksum, it aborts.
 - It does **not** verify signatures.
 - You are trusting the upstream release assets and your network’s TLS path.
 
