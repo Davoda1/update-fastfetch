@@ -4,19 +4,24 @@
 #
 # For the full license text, see the LICENSE file in this repository.
 #
-# update-fastfetch — Fastfetch updater for Debian/Ubuntu-like systems
+# update-fastfetch — Fastfetch updater for Linux (.deb / .rpm)
 # - Detects installed version (or uses 0.0.0 if not installed)
-# - Auto-detects architecture and grabs the matching official .deb from the latest GitHub release
-# - Downloads to /tmp and installs via dpkg
+# - Auto-detects architecture and grabs the matching official package from the latest GitHub release
+# - Downloads to /tmp and installs via the detected package stack
 # - Supports optional --polyfilled flag (more portable build)
 # - Colorful -h/--help and -v/--version flags (colors auto-disable when not a TTY)
 #
-# Requirements: curl, awk, grep, dpkg, sha256sum, sudo (only if not root)
+# Package backends:
+#   - Debian-like: prefers nala > apt > dpkg
+#   - RPM-like:    prefers dnf > yum > zypper > rpm
+#
+# Requirements (varies by backend): curl, awk, grep, sha256sum, and one supported installer (above)
 # Source: https://github.com/fastfetch-cli/fastfetch/releases
 #
 # Exit codes:
 #   0  success / already up-to-date
 #   1  missing dependency / fatal error
+#   2  usage error
 
 set -eu
 
@@ -29,7 +34,7 @@ for _a in "$@"; do
 done
 
 # ---------- Globals ----------
-SELF_VERSION="1.0.0"
+SELF_VERSION="1.1.0"
 REPO_SLUG="fastfetch-cli/fastfetch"
 API_URL="https://api.github.com/repos/${REPO_SLUG}/releases/latest"
 
@@ -55,9 +60,49 @@ ok()   { printf "%s✔ %s %s\n" "$GREEN" "$RESET" "$*"; }
 warn() { printf "%s!%s %s\n" "$YELLOW" "$RESET" "$*"; }
 err()  { printf "%s✘ %s %s\n" "$RED" "$RESET" "$*" >&2; }
 
+# Compare two dot-separated versions (numeric segments). Returns:
+#   0 if equal
+#   1 if $1 > $2
+#   2 if $1 < $2
+vercmp() {
+    _a="${1:-0}"
+    _b="${2:-0}"
+
+    # Strip leading v (if any)
+    case "$_a" in v*) _a="${_a#v}";; esac
+    case "$_b" in v*) _b="${_b#v}";; esac
+
+    # We only care about numeric dot-separated segments. Missing segments are treated as 0.
+    # shellcheck disable=SC2039
+    IFS=.
+    # POSIX sh: "set --" is fine; restore IFS after.
+    set -- $_a
+    _a1="${1:-0}"; _a2="${2:-0}"; _a3="${3:-0}"; _a4="${4:-0}"
+    set -- $_b
+    _b1="${1:-0}"; _b2="${2:-0}"; _b3="${3:-0}"; _b4="${4:-0}"
+    IFS=' '
+
+    # Force numeric (awk is guaranteed later anyway, but keep pure sh here)
+    # Compare in order
+    for _seg in 1 2 3 4; do
+        eval "_x=\$_a${_seg}; _y=\$_b${_seg}"
+        # Empty -> 0
+        [ -n "${_x:-}" ] || _x=0
+        [ -n "${_y:-}" ] || _y=0
+
+        # Numeric compare via awk to avoid undefined behavior with leading zeros / big ints
+        _r="$(awk -v x="$_x" -v y="$_y" 'BEGIN{ if (x+0>y+0) print 1; else if (x+0<y+0) print 2; else print 0 }')"
+        case "$_r" in
+            1) return 1 ;;
+            2) return 2 ;;
+        esac
+    done
+    return 0
+}
+
 usage() {
     cat <<EOF
-${BOLD}update-fastfetch${RESET} — ${DIM}official binary updater for Fastfetch (.deb)${RESET}
+${BOLD}update-fastfetch${RESET} — ${DIM}official binary updater for Fastfetch (Linux .deb / .rpm)${RESET}
 
 ${BOLD}Usage:${RESET}
   ${YELLOW}update-fastfetch${RESET}              ${DIM}Check + update to latest release if newer${RESET}
@@ -69,17 +114,61 @@ ${BOLD}Usage:${RESET}
 
 ${BOLD}What it does:${RESET}
   • Detects your CPU architecture
+  • Detects a supported package stack (Debian-like or RPM-like)
   • Reads installed Fastfetch version (if present)
   • Queries GitHub for the latest release
-  • If newer: downloads the matching .deb to /tmp and installs via dpkg
-
+  • If newer: downloads the matching package to /tmp and installs it
   • Optionally installs the ${BOLD}polyfilled${RESET} build (more portable)
+
 ${BOLD}Requirements:${RESET}
-  curl, awk, grep, dpkg, sha256sum, sudo (only if not root)
+  curl, awk, grep, sha256sum, and one supported installer:
+    Debian-like: nala OR apt OR dpkg
+    RPM-like:    dnf OR yum OR zypper OR rpm
 
 ${BOLD}Source:${RESET}
   ${CYAN}https://github.com/${REPO_SLUG}/releases${RESET}
 EOF
+}
+
+detect_backend() {
+    # Linux only (for simplicity and safety)
+    OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
+    if [ "$OS_NAME" != "Linux" ]; then
+        err "Unsupported OS: $OS_NAME (this script supports Linux only)"
+        exit 1
+    fi
+
+    PKG_KIND=""
+    INSTALLER=""
+
+    # Prefer explicit tools over /etc/os-release heuristics; this is robust in containers/minimal systems.
+    if command -v dpkg >/dev/null 2>&1; then
+        PKG_KIND="deb"
+        if command -v nala >/dev/null 2>&1; then
+            INSTALLER="nala"
+        elif command -v apt >/dev/null 2>&1; then
+            INSTALLER="apt"
+        else
+            INSTALLER="dpkg"
+        fi
+    elif command -v rpm >/dev/null 2>&1; then
+        PKG_KIND="rpm"
+        if command -v dnf >/dev/null 2>&1; then
+            INSTALLER="dnf"
+        elif command -v yum >/dev/null 2>&1; then
+            INSTALLER="yum"
+        elif command -v zypper >/dev/null 2>&1; then
+            INSTALLER="zypper"
+        else
+            INSTALLER="rpm"
+        fi
+    else
+        err "No supported package tooling found."
+        err "Need either: dpkg (Debian-like) OR rpm (RPM-like)."
+        exit 1
+    fi
+
+    export PKG_KIND INSTALLER
 }
 
 # ---------- Args ----------
@@ -147,6 +236,8 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# Detect OS + backend before self-test so requirements are backend-aware
+detect_backend
 
 # ---------- Self-test ----------
 # In self-test mode we do NOT fail fast: we want to report every check.
@@ -172,20 +263,42 @@ if [ "${SELF_TEST:-0}" -eq 1 ]; then
         return 1
     }
 
+    say "${DIM}Backend:${RESET} ${BOLD}${PKG_KIND}${RESET} (${INSTALLER})"
+    say ""
+
     # ----- Tools / programs -----
     HAVE_CURL=0
     HAVE_AWK=0
     HAVE_GREP=0
-    HAVE_DPKG=0
+    HAVE_SHA=0
+    HAVE_INSTALLER=0
     HAVE_SUDO=0
 
-    HAVE_SHA=0
     if check_tool curl; then HAVE_CURL=1; fi
     if check_tool awk; then HAVE_AWK=1; fi
     if check_tool grep; then HAVE_GREP=1; fi
-    if check_tool dpkg; then HAVE_DPKG=1; fi
-
     if check_tool sha256sum; then HAVE_SHA=1; fi
+
+    # Backend-specific requirements
+    if [ "$PKG_KIND" = "deb" ]; then
+        # Installer already selected in detect_backend(); check its presence (should be true)
+        if check_tool "$INSTALLER"; then HAVE_INSTALLER=1; fi
+        # dpkg-query / dpkg --compare-versions are used when available; they should exist on Debian-like systems
+        if command -v dpkg >/dev/null 2>&1; then
+            ok "Tool: dpkg (available)"
+        else
+            warn "Tool: dpkg (missing) — version compare may be less strict"
+        fi
+    else
+        if check_tool "$INSTALLER"; then HAVE_INSTALLER=1; fi
+        if command -v rpm >/dev/null 2>&1; then
+            ok "Tool: rpm (available)"
+        else
+            err "Tool: rpm (missing) — required on RPM-like systems"
+            SELFTEST_FAIL=1
+        fi
+    fi
+
     # Root-aware sudo requirement
     if command -v id >/dev/null 2>&1; then
         UID_NOW="$(id -u 2>/dev/null || echo 1)"
@@ -253,9 +366,19 @@ fi
 need curl
 need awk
 need grep
-need dpkg
-
 need sha256sum
+
+# Backend-specific sanity checks
+if [ "$PKG_KIND" = "deb" ]; then
+    # Installer selection is already nala > apt > dpkg
+    need "$INSTALLER"
+    # dpkg is still useful for version compare; if missing, we fall back to vercmp()
+    if command -v dpkg >/dev/null 2>&1; then :; else warn "dpkg not found; using internal version compare." ; fi
+else
+    need rpm
+    need "$INSTALLER"
+fi
+
 # Use sudo only when not already root
 SUDO="sudo"
 if [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]; then
@@ -265,25 +388,33 @@ else
 fi
 
 # ---------- Detect arch -> release asset token ----------
-
 UNAME_M="$(uname -m 2>/dev/null || echo unknown)"
 ARCH_TOKEN=""
 case "$UNAME_M" in
-    x86_64|amd64)   ARCH_TOKEN="amd64"   ;;
-    aarch64|arm64)  ARCH_TOKEN="aarch64" ;;
-    armv7l|armv7|armhf) ARCH_TOKEN="armv7l" ;;  # <-- fixed to match upstream asset name
-    riscv64)        ARCH_TOKEN="riscv64" ;;
-    i686|i386)      ARCH_TOKEN="i686"    ;;
+    x86_64|amd64)        ARCH_TOKEN="amd64"   ;;
+    aarch64|arm64)       ARCH_TOKEN="aarch64" ;;
+    armv7l|armv7|armhf)  ARCH_TOKEN="armv7l"  ;;  # matches upstream asset name
+    armv6l|armv6)        ARCH_TOKEN="armv6l"  ;;
+    riscv64)             ARCH_TOKEN="riscv64" ;;
+    i686|i386)           ARCH_TOKEN="i686"    ;;
+    ppc64le)             ARCH_TOKEN="ppc64le" ;;
+    s390x)               ARCH_TOKEN="s390x"   ;;
     *)
         err "Unsupported or unknown arch: $UNAME_M"
         err "If your arch is supported upstream, please update the mapping in this script."
         exit 1
         ;;
 esac
+
+PKG_EXT="deb"
+if [ "$PKG_KIND" = "rpm" ]; then
+    PKG_EXT="rpm"
+fi
+
 if [ "${POLYFILLED:-0}" -eq 1 ]; then
-    ASSET_NAME_EXPECT="fastfetch-linux-${ARCH_TOKEN}-polyfilled.deb"
+    ASSET_NAME_EXPECT="fastfetch-linux-${ARCH_TOKEN}-polyfilled.${PKG_EXT}"
 else
-    ASSET_NAME_EXPECT="fastfetch-linux-${ARCH_TOKEN}.deb"
+    ASSET_NAME_EXPECT="fastfetch-linux-${ARCH_TOKEN}.${PKG_EXT}"
 fi
 
 # ---------- Determine installed version (or 0.0.0) ----------
@@ -291,11 +422,19 @@ CUR_VER="0.0.0"
 if command -v fastfetch >/dev/null 2>&1; then
     # "fastfetch 2.53.0 (x86_64)" -> field 2
     CUR_VER="$(fastfetch --version 2>/dev/null | awk 'NR==1{print $2}')"
-elif dpkg-query -W -f='${Status} ${Version}\n' fastfetch 2>/dev/null | grep -q '^install ok installed'; then
-    CUR_VER="$(dpkg-query -W -f='${Version}\n' fastfetch 2>/dev/null | awk 'NR==1{print $1}')"
+elif [ "$PKG_KIND" = "deb" ]; then
+    if command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W -f='${Status} ${Version}\n' fastfetch 2>/dev/null | grep -q '^install ok installed'; then
+        CUR_VER="$(dpkg-query -W -f='${Version}\n' fastfetch 2>/dev/null | awk 'NR==1{print $1}')"
+    fi
+else
+    if rpm -q fastfetch >/dev/null 2>&1; then
+        # VERSION-RELEASE -> take VERSION only
+        CUR_VER="$(rpm -q --qf '%{VERSION}\n' fastfetch 2>/dev/null | awk 'NR==1{print $1}')"
+    fi
 fi
 [ -n "$CUR_VER" ] || CUR_VER="0.0.0"
 
+say "${CYAN}Backend:${RESET} ${BOLD}${PKG_KIND}${RESET} (${INSTALLER})"
 say "${CYAN}Detected arch:${RESET} ${BOLD}$UNAME_M${RESET} → asset: ${BOLD}$ASSET_NAME_EXPECT${RESET}"
 say "${CYAN}Installed:${RESET} ${BOLD}$CUR_VER${RESET}"
 
@@ -339,14 +478,29 @@ else
 fi
 
 # ---------- Compare versions ----------
-if dpkg --compare-versions "$LATEST_VER" le "$CUR_VER"; then
+UPTODATE=0
+if [ "$PKG_KIND" = "deb" ] && command -v dpkg >/dev/null 2>&1; then
+    if dpkg --compare-versions "$LATEST_VER" le "$CUR_VER"; then
+        UPTODATE=1
+    fi
+else
+    vercmp "$LATEST_VER" "$CUR_VER" || true
+    _rc="$?"
+    # vercmp: 2 means latest < current; 0 means equal
+    if [ "$_rc" -eq 0 ] || [ "$_rc" -eq 2 ]; then
+        UPTODATE=1
+    fi
+fi
+
+if [ "$UPTODATE" -eq 1 ]; then
     ok "Fastfetch is up-to-date."
     exit 0
 fi
+
 say "${BLUE}Updating Fastfetch from ${CUR_VER} → ${LATEST_VER}${RESET}"
 
-# ---------- Find matching .deb asset URL from JSON ----------
-# Prefer exact (non-polyfilled) match; grab its "browser_download_url"
+# ---------- Find matching asset URL from JSON ----------
+# Prefer exact match; grab its "browser_download_url"
 ASSET_URL="$(printf "%s" "$LATEST_JSON" \
   | awk -v want="$ASSET_NAME_EXPECT" -F'"' '
       $2=="name" && $4==want {found=1}
@@ -360,38 +514,33 @@ fi
 
 if [ -z "$ASSET_URL" ]; then
     err "Could not find asset '${ASSET_NAME_EXPECT}' in the latest release."
-    warn "Available .deb assets in this release:"
-    printf "%s\n" "$LATEST_JSON" | awk -F'"' '/"name"[[:space:]]*:/ && $4 ~ /\.deb$/ {print "  - " $4}' || true
+    warn "Available assets in this release:"
+    printf "%s\n" "$LATEST_JSON" | awk -F'"' '/"name"[[:space:]]*:/ {print "  - " $4}' || true
     exit 1
 fi
 ok "Found asset: $ASSET_NAME_EXPECT"
 
 # ---------- Download to /tmp ----------
-TMP_DEB="$(mktemp "/tmp/${ASSET_NAME_EXPECT}.XXXXXX")"
+TMP_PKG="$(mktemp "/tmp/${ASSET_NAME_EXPECT}.XXXXXX")"
 say "Downloading: ${ASSET_URL}"
-DL_CODE="$(curl -sS -fL -o "$TMP_DEB" -w '%{http_code}' "$ASSET_URL" 2>/dev/null || echo "000")"
+DL_CODE="$(curl -sS -fL -o "$TMP_PKG" -w '%{http_code}' "$ASSET_URL" 2>/dev/null || echo "000")"
 if [ "$DL_CODE" != "200" ]; then
     warn "Download HTTP status: $DL_CODE"
 fi
-if [ ! -s "$TMP_DEB" ]; then
-    rm -f "$TMP_DEB"
+if [ ! -s "$TMP_PKG" ]; then
+    rm -f "$TMP_PKG"
     err "Download failed or empty file."
     exit 1
 fi
-ok "Downloaded to $TMP_DEB"
-
+ok "Downloaded to $TMP_PKG"
 
 # ---------- Verify SHA-256 (from upstream release notes) ----------
 # We require a matching SHA-256 for the exact asset path, e.g.:
-#   <hash>  fastfetch-linux-x86_64/fastfetch-linux-x86_64.deb
-# or:
-#   <hash>  fastfetch-linux-x86_64/fastfetch-linux-x86_64-polyfilled.deb
+#   <hash>  fastfetch-linux-amd64/fastfetch-linux-amd64.deb
+#   <hash>  fastfetch-linux-amd64/fastfetch-linux-amd64.rpm
 #
 # If we cannot determine the expected hash, we abort rather than installing an unchecked file.
 say "Verifying SHA-256…"
-# We try both formats seen in upstream notes:
-#   1) "<hash>  <filename>"
-#   2) "<hash>  fastfetch-linux-<arch>/<filename>"
 ASSET_PATH1="$ASSET_NAME_EXPECT"
 ASSET_PATH2="fastfetch-linux-${ARCH_TOKEN}/${ASSET_NAME_EXPECT}"
 
@@ -399,7 +548,7 @@ REL_PAGE_URL="https://github.com/${REPO_SLUG}/releases/tag/${LATEST_VER}"
 REL_HTML_TMP="$(mktemp "/tmp/update-fastfetch.rel.XXXXXX")"
 REL_CODE="$(curl -sS -fL -o "$REL_HTML_TMP" -w '%{http_code}' "$REL_PAGE_URL" 2>/dev/null || echo "000")"
 if [ "$REL_CODE" != "200" ]; then
-    rm -f "$REL_HTML_TMP" "$TMP_DEB"
+    rm -f "$REL_HTML_TMP" "$TMP_PKG"
     err "Could not fetch release page for checksums (HTTP $REL_CODE)."
     exit 1
 fi
@@ -414,7 +563,7 @@ if [ -z "${EXPECTED_SHA:-}" ]; then
 fi
 
 if [ -z "${EXPECTED_SHA:-}" ]; then
-    rm -f "$TMP_DEB"
+    rm -f "$TMP_PKG"
     err "Could not locate SHA-256 for asset in release notes."
     err "Tried: $ASSET_PATH2"
     err "       $ASSET_PATH1"
@@ -422,9 +571,9 @@ if [ -z "${EXPECTED_SHA:-}" ]; then
     exit 1
 fi
 
-ACTUAL_SHA="$(sha256sum "$TMP_DEB" | awk '{print $1}')"
+ACTUAL_SHA="$(sha256sum "$TMP_PKG" | awk '{print $1}')"
 if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-    rm -f "$TMP_DEB"
+    rm -f "$TMP_PKG"
     err "SHA-256 mismatch for downloaded file."
     err "Expected: $EXPECTED_SHA"
     err "Actual:   $ACTUAL_SHA"
@@ -433,15 +582,92 @@ fi
 ok "SHA-256 verified."
 
 # ---------- Install ----------
-say "Installing via dpkg…"
-if ${SUDO:+$SUDO }dpkg -i "$TMP_DEB"; then
-    ok "Installed Fastfetch ${LATEST_VER}"
+say "Installing (${PKG_KIND})…"
+if [ "$PKG_KIND" = "deb" ]; then
+    case "$INSTALLER" in
+        nala)
+            # nala can install local .deb and resolves deps (recommended)
+            if ${SUDO:+$SUDO }nala install -y "$TMP_PKG"; then
+                ok "Installed Fastfetch ${LATEST_VER}"
+            else
+                err "nala install failed."
+                rm -f "$TMP_PKG"
+                exit 1
+            fi
+            ;;
+        apt)
+            # apt can install local .deb and resolves deps (recommended)
+            if ${SUDO:+$SUDO }apt install -y "$TMP_PKG"; then
+                ok "Installed Fastfetch ${LATEST_VER}"
+            else
+                err "apt install failed."
+                rm -f "$TMP_PKG"
+                exit 1
+            fi
+            ;;
+        dpkg)
+            if ${SUDO:+$SUDO }dpkg -i "$TMP_PKG"; then
+                ok "Installed Fastfetch ${LATEST_VER}"
+            else
+                err "dpkg install failed. You may need to resolve dependencies (e.g., sudo apt -f install) and re-run."
+                rm -f "$TMP_PKG"
+                exit 1
+            fi
+            ;;
+        *)
+            err "Internal error: unknown Debian installer '$INSTALLER'"
+            rm -f "$TMP_PKG"
+            exit 1
+            ;;
+    esac
 else
-    err "dpkg install failed. You may need to resolve dependencies (e.g., sudo apt -f install) and re-run."
-    rm -f "$TMP_DEB"
-    exit 1
+    case "$INSTALLER" in
+        dnf)
+            if ${SUDO:+$SUDO }dnf install -y "$TMP_PKG"; then
+                ok "Installed Fastfetch ${LATEST_VER}"
+            else
+                err "dnf install failed."
+                rm -f "$TMP_PKG"
+                exit 1
+            fi
+            ;;
+        yum)
+            if ${SUDO:+$SUDO }yum install -y "$TMP_PKG"; then
+                ok "Installed Fastfetch ${LATEST_VER}"
+            else
+                err "yum install failed."
+                rm -f "$TMP_PKG"
+                exit 1
+            fi
+            ;;
+        zypper)
+            # zypper supports installing local rpm files via "install ./file.rpm"
+            if ${SUDO:+$SUDO }zypper --non-interactive install "$TMP_PKG"; then
+                ok "Installed Fastfetch ${LATEST_VER}"
+            else
+                err "zypper install failed."
+                rm -f "$TMP_PKG"
+                exit 1
+            fi
+            ;;
+        rpm)
+            # rpm alone doesn't resolve dependencies; we keep it as last-resort.
+            if ${SUDO:+$SUDO }rpm -Uvh --replacepkgs "$TMP_PKG"; then
+                ok "Installed Fastfetch ${LATEST_VER}"
+            else
+                err "rpm install failed. Consider installing with dnf/yum/zypper for dependency resolution."
+                rm -f "$TMP_PKG"
+                exit 1
+            fi
+            ;;
+        *)
+            err "Internal error: unknown RPM installer '$INSTALLER'"
+            rm -f "$TMP_PKG"
+            exit 1
+            ;;
+    esac
 fi
 
 # ---------- Cleanup ----------
-rm -f "$TMP_DEB"
+rm -f "$TMP_PKG"
 say "${GREEN}Done.${RESET} ${DIM}(temporary file removed)${RESET}"
